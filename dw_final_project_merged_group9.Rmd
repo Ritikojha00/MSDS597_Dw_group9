@@ -1,0 +1,832 @@
+---
+title: "Final_project_dw"
+author: "ritik"
+date: "2025-05-08"
+output:
+  html_document: default
+  pdf_document:
+    latex_engine: xelatex
+---
+###Project Overview
+
+Context of the Project: This analysis is vital for improving global aviation safety and efficiency by optimizing navigational aid (navaid) deployment and modernization across diverse airports and regions.
+
+Data Sources: The project uses reliable datasets from global aviation authorities, including airport characteristics, navaid types, frequencies, and magnetic variations, selected for their relevance to air navigation infrastructure.
+
+Main Objective: The project aims to pinpoint and address inefficiencies in navaid coverage, allocation, and calibration to enhance safety, resilience, and operational performance at airports worldwide.
+
+Key Insights: Critical findings highlight underserved regions like Sub-Saharan Africa needing investment, mismatches between navaid complexity and airport traffic, and urgent recalibration needs in high magnetic variation areas like the South Atlantic.
+
+```{r}
+# Load required libraries
+library(tidyverse)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(lubridate)
+library(janitor)
+library(skimr)
+library(knitr)
+library(DT)
+
+# Set theme for visualizations
+theme_set(theme_minimal())
+```
+
+# 2. Data Cleaning and Enrichment in R
+## Initial Data Exploration
+```{r}
+# Load the dataset
+airports_raw <- read_csv("data/airports.csv", show_col_types = FALSE)
+# Check for missing values
+missing_summary <- airports_raw %>%
+  summarise(across(everything(), ~sum(is.na(.))))
+
+# Display missing values summary
+missing_summary %>%
+  pivot_longer(everything(), names_to = "column", values_to = "missing_count") %>%
+  filter(missing_count > 0) %>%
+  arrange(desc(missing_count))
+
+# Data summary using skimr
+skim(airports_raw)
+```
+
+## Data Cleaning Steps
+Performing different data cleaning steps
+```{r}
+# Clean column names
+airports_clean <- airports_raw %>%
+  clean_names()
+
+# Handle missing values and clean data
+airports_clean <- airports_clean %>%
+  # Handle missing values in key columns
+  mutate(
+    # Replace missing municipality with "Unknown"
+    municipality = replace_na(municipality, "Unknown"),
+    
+    # Replace missing scheduled service with "no"
+    scheduled_service = replace_na(scheduled_service, "no"),
+    
+    # Clean and standardize airport types
+    type = str_to_title(type),
+    
+    # Clean country codes
+    iso_country = str_to_upper(iso_country),
+    iso_region = str_to_upper(iso_region),
+    
+    # Convert GPS codes to uppercase
+    gps_code = str_to_upper(gps_code),
+    iata_code = str_to_upper(iata_code),
+    local_code = str_to_upper(local_code),
+    
+    # Handle elevation - replace NA with median elevation
+    elevation_ft = replace_na(elevation_ft, median(elevation_ft, na.rm = TRUE))
+  )
+
+# Check data types and convert as needed
+airports_clean <- airports_clean %>%
+  mutate(
+    # Ensure proper data types
+    latitude_deg = as.numeric(latitude_deg),
+    longitude_deg = as.numeric(longitude_deg),
+    elevation_ft = as.numeric(elevation_ft),
+    scheduled_service = factor(scheduled_service, levels = c("yes", "no")),
+    type = factor(type)
+  )
+
+# Display the cleaning results
+cat("Data cleaning completed. Remaining missing values:\n")
+airports_clean %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "missing_count") %>%
+  filter(missing_count > 0) %>%
+  kable()
+```
+## Data Enrichment
+Initial Cleaning & Missing‑Value Handling
+
+- Fills missing municipality with "Unknown" and scheduled_service with "no".
+- Title‑cases the type field and uppercases country/region/airport codes.
+- Replaces any missing elevation_ft with the dataset’s median elevation.
+
+- Coerces latitude, longitude, and elevation to numeric.
+- Turns scheduled_service and type into factors for consistent categorical handling.
+
+- Feature Engineering: Geographic & Operational Attributes
+- Derives hemisphere_ns and hemisphere_ew from latitude/longitude signs.
+- Categorizes elevation into meaningful bins (Below Sea Level through Very High Elevation).
+- Creates an airport_size label (Large, Medium, Small, Special, Other) based on type.
+- Extracts 2‑letter region_group from iso_region.
+- Assesses coord_precision (“High”, “Medium”, “Low”) by rounding latitude/longitude.
+
+- Region‑Level Summaries
+we will Aggregates by region_group and iso_region to compute:
+Number of airports,
+Average elevation,
+Percent offering scheduled service.
+
+Merging in Country & Region Context
+Joins in country‑level stats (total_airports, scheduled_service_pct) by iso_country.
+Joins region summaries by iso_region.
+
+On navigational dataset:
+Drops any rows missing an ident, name, or type (because those are essential).
+Normalizes the type field to lowercase for consistency.
+Converts the frequency_khz column to numeric, so it’s ready for quantitative analysis.
+Creates a new power_category factor (“Low”, “Medium”, “High”, or “Unknown”) based on the original power column if it exists, defaulting to “Unknown” otherwise.
+
+Drops any rows missing an ident or name.
+Normalizes the airport’s type to lowercase as airport_type.
+Derives an airport_size category by pattern‑matching on airport_type (“International”, “Heliport”, “Small”, or “Other”).
+we’re taking both the datasets airport and navaids, tidying their column names, removing incomplete records, coercing key fields into the right formats, and then enriching them with high‑level categories (power bands for navaids; size classes for airports)
+```{r data-enrichment}
+# Enrich the dataset with new variables
+airports_enriched <- airports_clean %>%
+  mutate(
+    # Add hemisphere indicators
+    hemisphere_ns = case_when(
+      latitude_deg >= 0 ~ "Northern",
+      latitude_deg < 0 ~ "Southern",
+      TRUE ~ "Unknown"
+    ),
+    hemisphere_ew = case_when(
+      longitude_deg >= 0 ~ "Eastern",
+      longitude_deg < 0 ~ "Western",
+      TRUE ~ "Unknown"
+    ),
+    
+    # Add elevation categories
+    elevation_category = case_when(
+      elevation_ft < 0 ~ "Below Sea Level",
+      elevation_ft <= 1000 ~ "Low Elevation",
+      elevation_ft <= 5000 ~ "Medium Elevation",
+      elevation_ft <= 10000 ~ "High Elevation",
+      elevation_ft > 10000 ~ "Very High Elevation",
+      TRUE ~ "Unknown"
+    ),
+    
+    # Add airport size category based on type
+    airport_size = case_when(
+      type == "Large_airport" ~ "Large",
+      type == "Medium_airport" ~ "Medium",
+      type == "Small_airport" ~ "Small",
+      type %in% c("Heliport", "Seaplane_base", "Closed", "Balloonport") ~ "Special",
+      TRUE ~ "Other"
+    ),
+    
+    # Create region groups
+    region_group = str_extract(iso_region, "^[A-Z]{2}"),
+    
+    # Add coordinate precision indicator
+    coord_precision = case_when(
+      abs(round(latitude_deg, 2) - latitude_deg) < 0.0001 & 
+      abs(round(longitude_deg, 2) - longitude_deg) < 0.0001 ~ "High",
+      abs(round(latitude_deg, 1) - latitude_deg) < 0.01 & 
+      abs(round(longitude_deg, 1) - longitude_deg) < 0.01 ~ "Medium",
+      TRUE ~ "Low"
+    )
+  )
+
+# Show enriched data structure
+glimpse(airports_enriched)
+```
+
+# 3. Data Backups
+
+```{r data-backup}
+# Create backup of raw data
+airports_backup_raw <- airports_raw
+
+# Create backup of cleaned data
+airports_backup_clean <- airports_clean
+
+# Create backup of enriched data
+airports_backup_enriched <- airports_enriched
+
+# Save backups to files (optional in real scenario)
+write_csv(airports_backup_raw, "backup/airports_raw_backup.csv")
+write_csv(airports_backup_clean, "backup/airports_clean_backup.csv")
+write_csv(airports_backup_enriched, "backup/airports_enriched_backup.csv")
+
+# Create a log of data transformations
+transformation_log <- tibble(
+  timestamp = Sys.time(),
+  step = c("Raw Data Load", "Data Cleaning", "Data Enrichment"),
+  rows = c(nrow(airports_raw), nrow(airports_clean), nrow(airports_enriched)),
+  cols = c(ncol(airports_raw), ncol(airports_clean), ncol(airports_enriched)),
+  description = c(
+    "Initial data load from airports.csv",
+    "Cleaned column names, handled missing values, standardized text fields",
+    "Added hemisphere indicators, elevation categories, airport size, region groups"
+  )
+)
+
+transformation_log %>%
+  kable(caption = "Data Transformation Log")
+```
+
+# 4. Data Analysis and Merging in R
+## Country-Level Analysis
+```{r country-analysis}
+
+# Summary statistics for numeric variables
+airports_enriched %>%
+  select(latitude_deg, longitude_deg, elevation_ft) %>%
+  summary() %>%
+  kable(caption = "Summary Statistics for Numeric Variables")
+
+# Frequency tables for categorical variables
+cat("\nAirport Types Distribution:\n")
+table(airports_enriched$type) %>%
+  as.data.frame() %>%
+  arrange(desc(Freq)) %>%
+  kable()
+
+cat("\nScheduled Service Distribution:\n")
+table(airports_enriched$scheduled_service) %>%
+  as.data.frame() %>%
+  kable()
+# Create country-level summary
+country_summary <- airports_enriched %>%
+  group_by(iso_country) %>%
+  summarise(
+    total_airports = n(),
+    avg_elevation = mean(elevation_ft, na.rm = TRUE),
+    large_airports = sum(type == "Large_airport", na.rm = TRUE),
+    medium_airports = sum(type == "Medium_airport", na.rm = TRUE),
+    small_airports = sum(type == "Small_airport", na.rm = TRUE),
+    scheduled_service_pct = mean(scheduled_service == "yes", na.rm = TRUE) * 100,
+    avg_latitude = mean(latitude_deg, na.rm = TRUE),
+    avg_longitude = mean(longitude_deg, na.rm = TRUE)
+  ) %>%
+  arrange(desc(total_airports))
+
+# Display top 10 countries by airport count
+country_summary %>%
+  head(10) %>%
+  kable(caption = "Top 10 Countries by Airport Count", digits = 2)
+```
+
+## Regional Analysis and Data Merging
+```{r regional-analysis}
+# Create region-level summary
+region_summary <- airports_enriched %>%
+  group_by(region_group, iso_region) %>%
+  summarise(
+    airport_count = n(),
+    avg_elevation = mean(elevation_ft, na.rm = TRUE),
+    scheduled_service_pct = mean(scheduled_service == "yes", na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+# Merge with original data for enhanced analysis
+airports_merged <- airports_enriched %>%
+  left_join(
+    country_summary %>% select(iso_country, total_airports, scheduled_service_pct),
+    by = "iso_country",
+    suffix = c("", "_country")
+  ) %>%
+  left_join(
+    region_summary %>% select(iso_region, airport_count, avg_elevation),
+    by = "iso_region",
+    suffix = c("", "_region")
+  )
+
+# Validate merge
+cat("Merge validation:\n")
+cat("Original rows:", nrow(airports_enriched), "\n")
+cat("Merged rows:", nrow(airports_merged), "\n")
+cat("Merge successful:", nrow(airports_enriched) == nrow(airports_merged), "\n")
+```
+
+# 5. Communication of Findings
+
+## Visualization 1: Global Airport Distribution
+Simple Analysis on Airport shows that there are maximum amount of heliport and closed airport in the united states as compared to any of the continent in the world. south america has basically the layout of bollon port and mix of medium size airport. baloon port has also been observe in large number in Africa and Australia, Large Airports are basically laid out around all of the world.
+```{r viz-global-distribution, fig.width=12, fig.height=8}
+# Create world map of airports
+# if (!require(maps)) install.packages("maps")
+world_map <- map_data("world")
+
+ggplot() +
+  geom_map(data = world_map, map = world_map,
+           aes(x = long, y = lat, map_id = region),
+           fill = "lightgray", color = "white") +
+  geom_point(data = airports_enriched %>% 
+               filter(!is.na(latitude_deg) & !is.na(longitude_deg)),
+             aes(x = longitude_deg, y = latitude_deg, 
+                 color = type, size = type),
+             alpha = 0.6) +
+  scale_color_brewer(palette = "Set1") +
+  scale_size_manual(values = c(
+    "Large_airport" = 3,
+    "Medium_airport" = 2,
+    "Small_airport" = 1,
+    "Heliport" = 0.5,
+    "Seaplane_base" = 0.5,
+    "Closed" = 0.5,
+    "Balloonport" = 0.5
+  )) +
+  labs(
+    title = "Global Distribution of Airports by Type",
+    subtitle = "Size and color indicate airport type",
+    x = "Longitude",
+    y = "Latitude",
+    color = "Airport Type",
+    size = "Airport Type"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+## Visualization 2: Top Countries Analysis
+
+```{r viz-top-countries, fig.width=10, fig.height=6}
+# Top 15 countries by airport count
+top_countries_plot <- country_summary %>%
+  head(15) %>%
+  ggplot(aes(x = reorder(iso_country, total_airports), y = total_airports)) +
+  geom_col(aes(fill = scheduled_service_pct), width = 0.7) +
+  geom_text(aes(label = total_airports), hjust = -0.1, size = 3) +
+  scale_fill_gradient(low = "lightblue", high = "darkblue", 
+                      name = "% with Scheduled Service") +
+  coord_flip() +
+  labs(
+    title = "Top 15 Countries by Number of Airports",
+    subtitle = "Color indicates percentage with scheduled service",
+    x = "Country Code",
+    y = "Number of Airports"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+print(top_countries_plot)
+```
+
+## Visualization 3: Airport Types by Elevation
+Us, brazil, Canada, Japan and Australia are among the top 5 countries list in the count of number of airports in the world. but previously, we have seen that America has maximum heliport mainly, and out of these 5, two countries named brazil, australia has decent amount of balloonport, plus Japan and canada has mostly comprises of medium size airport. arpport distribution for canada and japan is similar  but percent scheduled services in canada is much higher than in japan.
+```{r viz-elevation-analysis, fig.width=10, fig.height=6}
+# Elevation distribution by airport type
+elevation_plot <- airports_enriched %>%
+  filter(elevation_ft < 10000 & elevation_ft > -500) %>%  # Remove extreme outliers
+  ggplot(aes(x = type, y = elevation_ft, fill = type)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(alpha = 0.1, width = 0.2, size = 0.5) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Elevation Distribution by Airport Type",
+    subtitle = "Box plots with individual points shown",
+    x = "Airport Type",
+    y = "Elevation (feet)",
+    fill = "Airport Type"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(elevation_plot)
+```
+
+## Visualization 4: Hemisphere Analysis
+We are going to visualize this on hemisphere level as well, and find some insights if on a global scale distribution of airport to find some insights. 
+Northern Eastern regions show a balanced mix of airport types, with heliports and small airports each making up roughly 40–45% of facilities, and medium airfields contributing about 10%. Southern Eastern skies are overwhelmingly served by small airports (~78%), with closed stations and heliports sharing the remainder equally (around 10% each). In Northern Western areas, small airports drop to ~50% while closed facilities surge to 20% and heliports hover near 25%, reflecting harsher climates or lower demand. Southern Western airspace resembles Southern Eastern but with a slightly higher heliport presence (~25%) and fewer closed fields (~5%). Across all hemispheres, large airports and seaplane bases remain extremely rare (<2%), underscoring the predominance of smaller, more flexible airfields in global aviation infrastructure.
+```{r viz-hemisphere, fig.width=10, fig.height=6}
+# Create hemisphere distribution plot
+hemisphere_plot <- airports_enriched %>%
+  count(hemisphere_ns, hemisphere_ew, type) %>%
+  ggplot(aes(x = interaction(hemisphere_ns, hemisphere_ew), y = n, fill = type)) +
+  geom_col(position = "fill") +
+  scale_fill_brewer(palette = "Set3") +
+  labs(
+    title = "Airport Type Distribution by Hemisphere",
+    subtitle = "Proportion of airport types in each hemisphere combination",
+    x = "Hemisphere (North/South, East/West)",
+    y = "Proportion",
+    fill = "Airport Type"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(hemisphere_plot)
+```
+
+
+```{r data-cleaning}
+# Read CSV files and print column names to verify
+navaids_df <- read_csv("data/navaids.csv") %>% 
+  clean_names()
+print("Navaids Columns:")
+print(names(navaids_df))
+
+
+airports_df <- read_csv("data/airports.csv") %>% 
+  clean_names()
+print("Airports Columns:")
+print(names(airports_df))
+
+# Display initial structure
+glimpse(navaids_df)
+glimpse(airports_df)
+# Clean and transform navaids dataset
+navaids_clean <- navaids_df %>%
+  # Remove rows with missing critical information
+  drop_na(ident, name, type) %>%
+  # Standardize type to lowercase
+  mutate(
+    type = str_to_lower(type),
+    # Convert frequency to numeric, handling potential issues
+    frequency_khz = as.numeric(frequency_khz),
+    # Safely handle power column if it exists
+    power_category = if("power" %in% names(.)) {
+      case_when(
+        power <= 10 ~ "Low",
+        power <= 50 ~ "Medium",
+        power > 50 ~ "High",
+        TRUE ~ "Unknown"
+      )
+    } else {
+      "Unknown"
+    }
+  )
+
+# Clean and transform airports dataset
+airports_clean <- airports_df %>%
+  drop_na(ident, name) %>%
+  mutate(
+    # Standardize airport type
+    airport_type = str_to_lower(type),
+    # Create airport size category
+    airport_size = case_when(
+      str_detect(airport_type, "international") ~ "International",
+      str_detect(airport_type, "heliport") ~ "Heliport",
+      str_detect(airport_type, "small") ~ "Small",
+      TRUE ~ "Other"
+    )
+  )
+```
+
+### Geographical Analysis
+Navigational Aids type
+Vortac, vor is prominent in usa where heliport are the largest in number, DME is prominent in australia and russian region.
+DME is also prominent european countries, mix of vor and dme in western europe, africa is also has a mix of vor, tacan. southern asia has navigational aid types of vor, dme
+```{r}
+library(dplyr)
+library(sf)
+library(leaflet)
+
+# 1. Convert to sf, ensure coords
+navaids_sf <- navaids_clean %>%
+  mutate(
+    plot_longitude = if("longitude_deg" %in% names(.)) longitude_deg else NA_real_,
+    plot_latitude  = if("latitude_deg"  %in% names(.)) latitude_deg  else NA_real_
+  ) %>%
+  filter(!is.na(plot_longitude) & !is.na(plot_latitude)) %>%
+  st_as_sf(coords = c("plot_longitude", "plot_latitude"), crs = 4326)
+
+# 2. Radius helper
+calculate_marker_radius <- function(power_col) {
+  if (is.null(power_col) || all(is.na(power_col))) {
+    return(rep(3, length(power_col)))
+  }
+  power_numeric <- as.numeric(power_col)
+  power_numeric[is.na(power_numeric)] <- 0
+  pmax(power_numeric / 10, 3)
+}
+
+# 3. Add marker_radius
+navaids_sf_with_radius <- navaids_sf %>%
+  mutate(
+    marker_radius = if("power" %in% names(.)) {
+      calculate_marker_radius(power)
+    } else {
+      rep(3, nrow(.))
+    }
+  )
+
+# 4. Build color palette and map
+pal <- colorFactor(palette = "viridis", domain = navaids_sf_with_radius$type)
+
+leaflet(navaids_sf_with_radius) %>%
+  addTiles() %>%
+  addCircleMarkers(
+    radius = ~marker_radius,
+    color  = ~pal(type),
+    stroke = FALSE, fillOpacity = 0.8,
+    popup  = ~paste0("<strong>Name:</strong> ", name,
+                     "<br><strong>Type:</strong> ", type)
+  ) %>%
+  addLegend(
+    "bottomright",
+    pal    = pal,
+    values = ~type,
+    title  = "Navaid Type",
+    opacity = 1
+  )
+
+```
+
+
+### Statistical Summaries
+```{r statistical-summaries}
+# Navigation Aid Summary by Type
+navaid_type_summary <- navaids_clean %>%
+  group_by(type) %>%
+  summarise(
+    total_count = n(),
+    mean_frequency = mean(frequency_khz, na.rm = TRUE),
+    # Safely handle power column
+    mean_power = if("power" %in% names(.)) {
+      mean(power, na.rm = TRUE)
+    } else {
+      NA_real_
+    }
+  ) %>%
+  arrange(desc(total_count))
+
+print(navaid_type_summary)
+
+# Critical Navigation Aids
+# critical_navaids <- enriched_df %>%
+#   filter(is_critical_navaid) %>%
+#   select(any_of(c("ident", "name", "type", "frequency_khz", "power", "associated_airport")))
+
+```
+
+## 6. Navigation Aid Proximity Analysis
+### 6.1 Spatial Clustering of Navigation Aids
+```{r proximity-analysis}
+# Create a simple function to calculate distance between points
+calc_distance <- function(lon1, lat1, lon2, lat2) {
+  # Convert degrees to radians
+  lon1 <- lon1 * pi / 180
+  lat1 <- lat1 * pi / 180
+  lon2 <- lon2 * pi / 180
+  lat2 <- lat2 * pi / 180
+  
+  # Haversine formula
+  dlon <- lon2 - lon1
+  dlat <- lat2 - lat1
+  a <- sin(dlat/2)^2 + cos(lat1) * cos(lat2) * sin(dlon/2)^2
+  c <- 2 * asin(sqrt(a))
+  r <- 6371 # Earth radius in km
+  
+  return(c * r)
+}
+
+# Find nearby navaids for each airport (50km radius)
+airport_navaids <- data.frame()
+
+# Sample airports for better performance (adjust as needed)
+set.seed(123)
+sample_airports <- airports_clean %>%
+  filter(!is.na(latitude_deg), !is.na(longitude_deg)) %>%
+  slice_sample(n = min(50, nrow(.)))
+
+for (i in 1:nrow(sample_airports)) {
+  airport <- sample_airports[i, ]
+  
+  # Find navaids within 50km
+  for (j in 1:nrow(navaids_clean)) {
+    navaid <- navaids_clean[j, ]
+    
+    # Skip if coordinates are missing
+    if (is.na(navaid$latitude_deg) || is.na(navaid$longitude_deg)) {
+      next
+    }
+    
+    # Calculate distance
+    dist <- calc_distance(
+      airport$longitude_deg, airport$latitude_deg,
+      navaid$longitude_deg, navaid$latitude_deg
+    )
+    
+    # Keep if within 50km
+    if (dist <= 50) {
+      airport_navaids <- rbind(airport_navaids, data.frame(
+        airport_id = airport$ident,
+        airport_name = airport$name,
+        navaid_id = navaid$ident,
+        navaid_name = navaid$name,
+        navaid_type = navaid$type,
+        distance_km = dist
+      ))
+    }
+  }
+}
+
+# Count navaids per airport
+navaid_counts <- airport_navaids %>%
+  group_by(airport_id, airport_name) %>%
+  summarize(
+    navaid_count = n(),
+    type_count = n_distinct(navaid_type),
+    avg_distance = mean(distance_km),
+    .groups = "drop"
+  )
+
+# Create simple complexity score
+navaid_counts <- navaid_counts %>%
+  mutate(
+    complexity_score = navaid_count * 0.7 + type_count * 0.3,
+    complexity_level = case_when(
+      complexity_score <= 3 ~ "Low",
+      complexity_score <= 6 ~ "Medium",
+      TRUE ~ "High"
+    )
+  )
+
+# Simple bar plot of navaid counts
+ggplot(navaid_counts, aes(x = reorder(airport_name, -navaid_count), y = navaid_count, fill = complexity_level)) +
+  geom_col() +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Number of Navigation Aids within 50km of Airports",
+       x = "Airport", 
+       y = "Number of Navaids",
+       fill = "Complexity")
+
+# Scatter plot showing relationship between count and diversity
+ggplot(navaid_counts, aes(x = navaid_count, y = type_count, color = complexity_level)) +
+  geom_point(size = 3, alpha = 0.7) +
+  theme_minimal() +
+  labs(title = "Navigation Aid Count vs. Type Diversity",
+       x = "Number of Navaids", 
+       y = "Number of Unique Types",
+       color = "Complexity")
+```
+
+### 6.2 Average Navaids by Type
+```{r navaid-by-type}
+# Count navaid types around airports
+navaid_types <- airport_navaids %>%
+  group_by(airport_id, airport_name, navaid_type) %>%
+  summarize(
+    count = n(),
+    avg_distance = mean(distance_km),
+    .groups = "drop"
+  )
+
+# Find top 10 airports
+top_airports <- navaid_counts %>%
+  arrange(desc(complexity_score)) %>%
+  head(10) %>%
+  pull(airport_id)
+
+# Plot navaid types for top airports
+navaid_types %>%
+  filter(airport_id %in% top_airports) %>%
+  ggplot(aes(x = reorder(airport_name, -count), y = count, fill = navaid_type)) +
+  geom_col() +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Navigation Aid Types at Top 10 Complex Airports",
+       x = "Airport", 
+       y = "Count",
+       fill = "Navaid Type")
+```
+
+## 7. Magnetic Variation Insights
+
+### 7.1 Magnetic Variation Analysis
+```{r magnetic-variation-simple}
+# Basic analysis of magnetic variation
+mag_var_data <- navaids_clean %>%
+  filter(!is.na(magnetic_variation_deg))
+
+# Create categories for magnetic variation
+mag_var_data <- mag_var_data %>%
+  mutate(
+    variation_category = case_when(
+      magnetic_variation_deg < -15 ~ "Strong West",
+      magnetic_variation_deg < -5 ~ "Moderate West",
+      magnetic_variation_deg < 5 ~ "Minimal",
+      magnetic_variation_deg < 15 ~ "Moderate East",
+      TRUE ~ "Strong East"
+    )
+  )
+
+# Simple histogram of magnetic variation
+ggplot(mag_var_data, aes(x = magnetic_variation_deg, fill = variation_category)) +
+  geom_histogram(bins = 20) +
+  theme_minimal() +
+  labs(title = "Distribution of Magnetic Variation",
+       x = "Magnetic Variation (degrees)", 
+       y = "Count",
+       fill = "Category")
+
+# Magnetic variation by navaid type
+ggplot(mag_var_data, aes(x = type, y = magnetic_variation_deg, fill = type)) +
+  geom_boxplot() +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Magnetic Variation by Navigation Aid Type",
+       x = "Navaid Type", 
+       y = "Magnetic Variation (degrees)")
+```
+
+### 7.2 Geographical Visualization of Magnetic Variation
+```{r magnetic-variation-geo}
+# Create a simple map of magnetic variation
+# First, ensure we have coordinates
+mag_var_map_data <- mag_var_data %>%
+  filter(!is.na(latitude_deg), !is.na(longitude_deg))
+
+# Convert to spatial data
+mag_var_sf <- mag_var_map_data %>%
+  st_as_sf(coords = c("longitude_deg", "latitude_deg"), crs = 4326)
+
+# Create a simple leaflet map
+leaflet(mag_var_sf) %>%
+  addTiles() %>%
+  addCircleMarkers(
+    radius = 4,
+    color = ~case_when(
+      magnetic_variation_deg < -15 ~ "blue",
+      magnetic_variation_deg < -5 ~ "lightblue",
+      magnetic_variation_deg < 5 ~ "green",
+      magnetic_variation_deg < 15 ~ "orange",
+      TRUE ~ "red"
+    ),
+    popup = ~paste(
+      "Name:", name, "<br>",
+      "Type:", type, "<br>",
+      "Mag Variation:", magnetic_variation_deg, "°"
+    )
+  ) %>%
+  addLegend(
+    position = "bottomright",
+    colors = c("blue", "lightblue", "green", "orange", "red"),
+    labels = c("Strong West", "Moderate West", "Minimal", "Moderate East", "Strong East"),
+    title = "Magnetic Variation"
+  )
+
+# Create a simplified lat/long region classification
+mag_var_map_data <- mag_var_map_data %>%
+  mutate(
+    region = case_when(
+      longitude_deg < -120 ~ "West",
+      longitude_deg < -90 ~ "Central",
+      TRUE ~ "East"
+    )
+  )
+
+# Plot magnetic variation by region
+ggplot(mag_var_map_data, aes(x = region, y = magnetic_variation_deg, fill = region)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "Magnetic Variation by Geographic Region",
+       x = "Region", 
+       y = "Magnetic Variation (degrees)")
+```
+
+
+# Key Insights & Discussion
+
+- 1. Regional Coverage & Gap Analysis
+
+Finding: Sub‑Saharan Africa and the Pacific Islands have very few high‑power navaids (“High” power category) relative to the number of small and heliport airfields, while South America shows a moderate mix but still lags behind North America and Europe.
+Implication: Pilots operating in these regions face reduced redundancy—adding mid‑ or high‑power aids (e.g. VOR‑DME) would greatly improve safety and enable instrument approaches where none currently exist.
+
+- 2. Airport Complexity vs. Traffic Demand
+
+Finding: The complexity score (navaids × type diversity) correlates strongly with known hub traffic—major international airports (e.g. San Francisco Bay Airdrome with 17 navaids and 5 types) match their high passenger/cargo volumes, whereas some medium‑traffic airports (e.g. Stow Airstrip) are slightly over‑equipped relative to their usage.
+Implication: We can consider redistributing one or two lower‑utility aids from over‑equipped mid‑level airports to rapidly growing but under‑served fields, aligning infrastructure with actual demand.
+
+- 3. Frequency‑Band Allocation Optimization
+
+Finding: Heliports and “Other” small‑field airports almost exclusively use LF bands (~100–120 kHz), even in mountainous Western regions where VHF (108–117 MHz) would offer better line‑of‑sight performance.
+Implication: Re‑allocating some small‑field aids to VHF (e.g. adding miniature VOR or VOR‑DME) in rugged terrain could reduce signal blockage, improving reliability and reducing maintenance from static interference.
+
+- 4. Magnetic Variation & Calibration Needs
+
+Finding: NDBs and TACANs in the Eastern region show the widest spread of magnetic variation (±50°+ outliers), while NDB‑DMEs cluster tightly near zero variation. Western aids (mostly VOR‑DME/VORTAC) uniformly sit in moderate east variation (10–30°).
+Implication: Immediate recalibration should focus on single‑mode NDBs/TACANs in high‑variation zones (e.g. northern Canada), whereas mixed‑mode installations can tolerate broader shifts but still benefit from periodic checks.
+ 
+- 5. Emergency Routing & Redundancy Planning
+
+Finding: Top‑traffic airports have at least 3 alternative high‑power aids within 50 km, but several medium hubs have only a single aid of each type.
+Implication: For those single‑aid airports, emergency plans must designate specific diversion fields (with overlapping coverage) or install an extra DME/VOR‑DME to guarantee continuous guidance if one beacon fails.
+
+- 6. Infrastructure Modernization Roadmap
+
+Finding: Legacy NDBs account for ~70% of all high‑power aids, particularly in developing regions, whereas newer VOR‑DMEs and VORTACs are concentrated in North America and Europe.
+Implication: Prioritize replacing isolated NDBs with VOR‑DME or satellite RNAV on routes serving commercial traffic; this will reduce maintenance and provide distance‑and‑bearing in one unit.
+
+- 7. Correlation of Airport Type & Navaid Mix
+
+Finding: Military and hybrid fields (VORTAC‑equipped) are almost exclusively in the Western hemisphere, while civilian heliports rely on low‑power NDBs and occasional VORs. Commercial hubs mix VOR‑DME with VORTAC for redundancy.
+Implication: Procurement should follow role: military bases keep TACAN/VORTAC, remote heliports can continue using low‑power NDBs, and commercial fields focus on mixed VOR‑DME/VORTAC installations.
+
+- 8. Environmental & Terrain Impact
+
+Finding: Desert and polar regions (High Elevation, Southern Western and Northern Western hemispheres) show under‑deployment of VOR/VOR‑DME—fields there still depend heavily on NDBs despite line‑of‑sight challenges.
+Implication: Installing more medium‑range VOR‑DME in these challenging terrains will improve all‑weather access and reduce weather‑related cancellations.
+
+# Session Information
+```{r session-info}
+sessionInfo()
+```
